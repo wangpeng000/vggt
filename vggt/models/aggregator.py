@@ -187,6 +187,8 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        encoder_only: Optional[bool] = False,
+        encoder_decoder: Optional[bool] = False,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -233,6 +235,14 @@ class Aggregator(nn.Module):
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
 
+        if encoder_only:
+            # If encoder_only is True, we only return the tokens and position
+            return tokens[:, self.patch_start_idx:].view(B, S, P, C), pos[:, self.patch_start_idx:].view(B, S, P, 2)
+        
+        if encoder_decoder:
+            tokens_encoder = tokens[:, self.patch_start_idx:].view(B, S, P, C)
+            pos_encoder = pos[:, self.patch_start_idx:].view(B, S, P, 2)
+        
         # update P because we added special tokens
         _, P, C = tokens.shape
 
@@ -261,6 +271,8 @@ class Aggregator(nn.Module):
         del concat_inter
         del frame_intermediates
         del global_intermediates
+        if encoder_decoder:
+            return output_list, self.patch_start_idx, tokens_encoder, pos_encoder
         return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
