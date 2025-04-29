@@ -122,15 +122,17 @@ class Aggregator(nn.Module):
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
-        self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
-        self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
+        # self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
+        # self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
+        self.intrinsic_encoder = nn.Linear(9, embed_dim)
 
         # The patch tokens start after the camera and register tokens
-        self.patch_start_idx = 1 + num_register_tokens
+        # self.patch_start_idx = 1 + num_register_tokens
+        self.patch_start_idx = 0
 
         # Initialize parameters with small values
-        nn.init.normal_(self.camera_token, std=1e-6)
-        nn.init.normal_(self.register_token, std=1e-6)
+        # nn.init.normal_(self.camera_token, std=1e-6)
+        # nn.init.normal_(self.register_token, std=1e-6)
 
         # Register normalization constants as buffers
         for name, value in (
@@ -187,6 +189,7 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        intrinsics: Optional[torch.Tensor] = None,
         encoder_only: Optional[bool] = False,
         encoder_decoder: Optional[bool] = False,
     ) -> Tuple[List[torch.Tensor], int]:
@@ -207,10 +210,16 @@ class Aggregator(nn.Module):
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
+        
+        if intrinsics is not None:
+            intrinsics_embedding = self.intrinsic_encoder(intrinsics.flatten(2))
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
-        patch_tokens = self.patch_embed(images)
+        if intrinsics is not None:
+            patch_tokens = self.patch_embed(images, intrinsics_embedding)
+        else:
+            patch_tokens = self.patch_embed(images)
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
@@ -218,11 +227,12 @@ class Aggregator(nn.Module):
         _, P, C = patch_tokens.shape
 
         # Expand camera and register tokens to match batch size and sequence length
-        camera_token = slice_expand_and_flatten(self.camera_token, B, S)
-        register_token = slice_expand_and_flatten(self.register_token, B, S)
+        # camera_token = slice_expand_and_flatten(self.camera_token, B, S)
+        # register_token = slice_expand_and_flatten(self.register_token, B, S)
 
         # Concatenate special tokens with patch tokens
-        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        # tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        tokens = patch_tokens
 
         pos = None
         if self.rope is not None:
@@ -234,6 +244,11 @@ class Aggregator(nn.Module):
             pos = pos + 1
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
+        
+        if intrinsics is not None:
+            add_pose = pos[:, 0:1, :].clone()
+            add_pose[:, :, 0] += (pos[:, -1, 0].unsqueeze(-1) + 1)
+            pos = torch.cat((pos, add_pose), dim=1)
 
         if encoder_only:
             # If encoder_only is True, we only return the tokens and position
@@ -271,6 +286,9 @@ class Aggregator(nn.Module):
         del concat_inter
         del frame_intermediates
         del global_intermediates
+        if intrinsics is not None:
+            for i in range(len(output_list)):
+                output_list[i] = output_list[i][:, :, :-1]
         if encoder_decoder:
             return output_list, self.patch_start_idx, tokens_encoder, pos_encoder
         return output_list, self.patch_start_idx

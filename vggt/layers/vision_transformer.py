@@ -18,6 +18,8 @@ from torch.utils.checkpoint import checkpoint
 from torch.nn.init import trunc_normal_
 from . import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
 
+from einops import rearrange
+
 logger = logging.getLogger("dinov2")
 
 
@@ -111,6 +113,7 @@ class DinoVisionTransformer(nn.Module):
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+        self.pos_embed_intrinsics = nn.Parameter(torch.zeros(1, 1, embed_dim))
         assert num_register_tokens >= 0
         self.register_tokens = (
             nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim)) if num_register_tokens else None
@@ -175,6 +178,7 @@ class DinoVisionTransformer(nn.Module):
 
     def init_weights(self):
         trunc_normal_(self.pos_embed, std=0.02)
+        trunc_normal_(self.pos_embed_intrinsics, std=0.02)
         nn.init.normal_(self.cls_token, std=1e-6)
         if self.register_tokens is not None:
             nn.init.normal_(self.register_tokens, std=1e-6)
@@ -212,26 +216,32 @@ class DinoVisionTransformer(nn.Module):
         )
         assert (w0, h0) == patch_pos_embed.shape[-2:]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+        # return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+        return patch_pos_embed
 
-    def prepare_tokens_with_masks(self, x, masks=None):
+    def prepare_tokens_with_masks(self, x, intrinsics=None, masks=None):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
 
-        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        x = x + self.interpolate_pos_encoding(x, w, h)
+        # x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        pos_embedding = self.interpolate_pos_encoding(x, w, h)
+        if intrinsics is not None:
+            intrinsics = rearrange(intrinsics, "b v dim -> (b v) 1 dim")
+            x = torch.cat((x, intrinsics), dim=1)
+            pos_embedding = torch.cat((pos_embedding, self.pos_embed_intrinsics.float()), dim=1)
+        x = x + pos_embedding
 
-        if self.register_tokens is not None:
-            x = torch.cat(
-                (
-                    x[:, :1],
-                    self.register_tokens.expand(x.shape[0], -1, -1),
-                    x[:, 1:],
-                ),
-                dim=1,
-            )
+        # if self.register_tokens is not None:
+        #     x = torch.cat(
+        #         (
+        #             x[:, :1],
+        #             self.register_tokens.expand(x.shape[0], -1, -1),
+        #             x[:, 1:],
+        #         ),
+        #         dim=1,
+        #     )
 
         return x
 
@@ -259,11 +269,11 @@ class DinoVisionTransformer(nn.Module):
             )
         return output
 
-    def forward_features(self, x, masks=None):
+    def forward_features(self, x, intrinsics=None, masks=None):
         if isinstance(x, list):
             return self.forward_features_list(x, masks)
 
-        x = self.prepare_tokens_with_masks(x, masks)
+        x = self.prepare_tokens_with_masks(x, intrinsics, masks)
 
         for blk in self.blocks:
             if self.use_checkpoint:
@@ -273,9 +283,9 @@ class DinoVisionTransformer(nn.Module):
 
         x_norm = self.norm(x)
         return {
-            "x_norm_clstoken": x_norm[:, 0],
-            "x_norm_regtokens": x_norm[:, 1 : self.num_register_tokens + 1],
-            "x_norm_patchtokens": x_norm[:, self.num_register_tokens + 1 :],
+            # "x_norm_clstoken": x_norm[:, 0],
+            # "x_norm_regtokens": x_norm[:, 1 : self.num_register_tokens + 1],
+            "x_norm_patchtokens": x_norm,
             "x_prenorm": x,
             "masks": masks,
         }
